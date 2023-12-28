@@ -979,7 +979,9 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                             self.xform_self_ty(item, new_trait_ref.self_ty(), new_trait_ref.args);
                         self.push_candidate(
                             Candidate {
-                                xform_self_ty,
+                                xform_self_ty: self
+                                    .resolve_xform_self_ty_if_associated_item(xform_self_ty)
+                                    .unwrap_or(xform_self_ty),
                                 xform_ret_ty,
                                 item,
                                 import_ids: import_ids.clone(),
@@ -1007,7 +1009,9 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                     self.xform_self_ty(item, trait_ref.self_ty(), trait_args);
                 self.push_candidate(
                     Candidate {
-                        xform_self_ty,
+                        xform_self_ty: self
+                            .resolve_xform_self_ty_if_associated_item(xform_self_ty)
+                            .unwrap_or(xform_self_ty),
                         xform_ret_ty,
                         item,
                         import_ids: import_ids.clone(),
@@ -1017,6 +1021,39 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                 );
             }
         }
+    }
+
+    fn resolve_xform_self_ty_if_associated_item(
+        &self,
+        xform_self_ty: Ty<'tcx>,
+    ) -> Option<Ty<'tcx>> {
+        let alias_ty = match xform_self_ty.kind() {
+            ty::Alias(_, alias_ty) => alias_ty,
+            _ => return None,
+        };
+        let assoc_recvr_id = alias_ty.def_id;
+        let assoc_item = self.tcx.associated_item(assoc_recvr_id);
+        let trait_def_id = assoc_item.container_id(self.tcx);
+        let impl_def_id = self.steps.iter().find_map(|step| {
+            self.tcx.non_blanket_impls_for_ty(trait_def_id, step.self_ty.value.value).next()
+        })?;
+
+        let impl_item_id =
+            match self.tcx.impl_item_implementor_ids(impl_def_id).get(&assoc_recvr_id).copied() {
+                Some(impl_item_id) => impl_item_id,
+                // associated item is not explicitly implemented in this impl
+                // search for associated item default
+                None => match self.tcx.defaultness(assoc_recvr_id) {
+                    rustc_hir::Defaultness::Default { has_value } if has_value => assoc_recvr_id,
+                    _ => return None,
+                },
+            };
+
+        let alias_item_args = self.fresh_args_for_item(self.span, impl_item_id);
+        let method_self_recvr_binder = self.tcx.type_of(impl_item_id);
+        let method_self_recvr = method_self_recvr_binder.instantiate(self.tcx, alias_item_args);
+
+        Some(method_self_recvr)
     }
 
     fn candidate_method_names(

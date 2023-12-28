@@ -8,13 +8,14 @@ use rustc_hir_analysis::astconv::generics::{
     check_generic_arg_count_for_call, create_args_for_parent_generic_args,
 };
 use rustc_hir_analysis::astconv::{AstConv, CreateSubstsForGenericArgsCtxt, IsMethodCall};
-use rustc_infer::infer::{self, DefineOpaqueTypes, InferOk};
+use rustc_infer::infer::{self, canonical::OriginalQueryValues, DefineOpaqueTypes, InferOk};
 use rustc_middle::traits::{ObligationCauseCode, UnifyReceiverContext};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCoercion};
 use rustc_middle::ty::adjustment::{AllowTwoPhase, AutoBorrow, AutoBorrowMutability};
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::{
-    self, GenericArgs, GenericArgsRef, GenericParamDefKind, Ty, TyCtxt, UserArgs, UserType,
+    self, GenericArgs, GenericArgsRef, GenericParamDefKind, ParamEnvAnd, Ty, TyCtxt, UserArgs,
+    UserType,
 };
 use rustc_span::{Span, DUMMY_SP};
 use rustc_trait_selection::traits;
@@ -102,7 +103,8 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         debug!("rcvr_args={rcvr_args:?}, all_args={all_args:?}");
 
         // Create the final signature for the method, replacing late-bound regions.
-        let (method_sig, method_predicates) = self.instantiate_method_sig(pick, all_args);
+        let (method_sig, method_predicates) =
+            self.instantiate_method_sig(&pick, rcvr_args, all_args, self_ty);
 
         // If there is a `Self: Sized` bound and `Self` is a trait object, it is possible that
         // something which derefs to `Self` actually implements the trait and the caller
@@ -244,6 +246,103 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         }
 
         target
+    }
+
+    fn resolve_method_sig_if_has_associated_rcvr(
+        &self,
+        sig: ty::FnSig<'tcx>,
+        self_ty: Ty<'tcx>,
+        pick: &probe::Pick<'tcx>,
+        rcvr_args: GenericArgsRef<'tcx>,
+    ) -> Option<ty::FnSig<'tcx>> {
+        let steps = self
+            .tcx
+            .method_autoderef_steps(self.canonicalize_query(
+                ParamEnvAnd { param_env: self.param_env, value: self_ty },
+                &mut OriginalQueryValues::default(),
+            ))
+            .steps;
+
+        let alias_ty = match sig.inputs()[0].kind() {
+            ty::Alias(_, alias_ty) => alias_ty,
+            _ => return None,
+        };
+        let assoc_rcvr_id = alias_ty.def_id;
+        let assoc_item = self.tcx.associated_item(assoc_rcvr_id);
+        let trait_def_id = assoc_item.container_id(self.tcx);
+        let (impl_def_id, step) = steps.iter().find_map(|step| {
+            self.tcx
+                .non_blanket_impls_for_ty(trait_def_id, step.self_ty.value.value)
+                .next()
+                .map(|x| (x, step))
+        })?;
+
+        let impl_item_id =
+            match self.tcx.impl_item_implementor_ids(impl_def_id).get(&assoc_rcvr_id).copied() {
+                Some(impl_item_id) => impl_item_id,
+                // associated item is not explicitly implemented in this impl
+                // search for associated item default
+                None => match self.tcx.defaultness(assoc_rcvr_id) {
+                    rustc_hir::Defaultness::Default { has_value } if has_value => assoc_rcvr_id,
+                    _ => return None,
+                },
+            };
+
+        let num_alias_self_args = alias_ty.args.len() - self.tcx.generics_of(trait_def_id).count();
+        let alias_self_args =
+            self.tcx.mk_args_from_iter(alias_ty.args.into_iter().take(num_alias_self_args));
+        let alias_item_args = self.fresh_args_for_item(self.span, impl_item_id);
+        let method_self_rcvr_binder = self.tcx.type_of(impl_item_id);
+
+        let method_self_rcvr = method_self_rcvr_binder.instantiate(self.tcx, alias_item_args);
+
+        let adjusted_fn_sig = self.tcx.mk_fn_sig(
+            self.tcx.mk_type_list(
+                &std::iter::once(method_self_rcvr)
+                    .chain(sig.inputs().into_iter().copied().skip(1))
+                    .collect::<Vec<_>>(),
+            ),
+            sig.output(),
+            sig.c_variadic,
+            sig.unsafety,
+            sig.abi,
+        );
+
+        let impl_self_ty = step.self_ty.value.value;
+        let self_arg_ty = alias_self_args[0].expect_ty();
+        let cause = self.cause(
+            self.self_expr.span,
+            ObligationCauseCode::UnifyReceiver(Box::new(UnifyReceiverContext {
+                assoc_item: pick.item,
+                param_env: self.param_env,
+                args: rcvr_args,
+            })),
+        );
+        match self.at(&cause, self.param_env).sup(DefineOpaqueTypes::No, impl_self_ty, self_arg_ty)
+        {
+            Ok(InferOk { obligations, value: () }) => {
+                self.register_predicates(obligations);
+            }
+            Err(terr) => {
+                // FIXME(arbitrary_self_types): We probably should limit the
+                // situations where this can occur by adding additional restrictions
+                // to the feature, like the self type can't reference method args.
+                if self.tcx.features().arbitrary_self_types {
+                    self.err_ctxt()
+                        .report_mismatched_types(&cause, impl_self_ty, self_arg_ty, terr)
+                        .emit();
+                } else {
+                    span_bug!(
+                        self.span,
+                        "{} was a subtype of {} but now is not?",
+                        self_arg_ty,
+                        impl_self_ty
+                    );
+                }
+            }
+        }
+
+        Some(adjusted_fn_sig)
     }
 
     /// Returns a set of substitutions for the method *receiver* where all type and region
@@ -534,7 +633,9 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
     fn instantiate_method_sig(
         &mut self,
         pick: &probe::Pick<'tcx>,
+        rcvr_args: GenericArgsRef<'tcx>,
         all_args: GenericArgsRef<'tcx>,
+        self_ty: Ty<'tcx>,
     ) -> (ty::FnSig<'tcx>, ty::InstantiatedPredicates<'tcx>) {
         debug!("instantiate_method_sig(pick={:?}, all_args={:?})", pick, all_args);
 
@@ -551,6 +652,10 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
         let sig = self.instantiate_binder_with_fresh_vars(sig);
         debug!("late-bound lifetimes from method instantiated, sig={:?}", sig);
+
+        let sig = self
+            .resolve_method_sig_if_has_associated_rcvr(sig, self_ty, pick, rcvr_args)
+            .unwrap_or(sig);
 
         (sig, method_predicates)
     }
